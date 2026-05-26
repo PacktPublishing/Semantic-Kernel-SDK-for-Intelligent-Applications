@@ -1,0 +1,764 @@
+Below is the **second lesson**, assuming the cleanup/refactor has already been completed and the current code now has a cleaner baseline:
+
+* `KnowledgeOps.AI` owns Azure OpenAI options and AI registrations.
+* `KnowledgeOps.AI` registers the reusable `IEmbeddingGenerator<string, Embedding<float>>`.
+* `KnowledgeOps.Web` no longer creates its own `AzureOpenAIClient`.
+* `DocumentProcessingService` is still responsible for extracting text and setting `ExtractedTextPreview`.
+
+# Lesson: Summarize PDFs with IronPDF AI and Semantic Kernel [Mini Demo]
+
+## Lesson purpose
+
+In the current document-processing pipeline, the app extracts PDF text and stores a preview by trimming the extracted text.
+
+That gives users something to see, but it is not a true summary.
+
+This mini demo improves the existing preview behavior:
+
+```text
+Before:
+Extract text → take first 1,000 characters → save as ExtractedTextPreview
+
+After:
+Extract text → ask IronPDF AI to summarize the PDF → save summary as ExtractedTextPreview
+                    ↓
+              fallback to old text preview if summary fails
+```
+
+This is a small, focused enhancement. We are not building a new RAG flow, not adding a new page, and not adding a new database field.
+
+---
+
+# What this demo does
+
+This demo adds IronPDF AI summarization into the existing `DocumentProcessingService`.
+
+It will:
+
+1. Add the IronPDF AI package.
+2. Add the minimum Semantic Kernel memory package required by IronPDF’s AI extension.
+3. Create an IronPDF AI initializer in `KnowledgeOps.AI`.
+4. Reuse the centralized kernel and embedding generator from the refactor.
+5. Update `CreatePreview` into `CreatePreviewAsync`.
+6. Let `CreatePreviewAsync` call `pdf.Summarize()`.
+7. Keep the old snippet preview as fallback.
+
+IronPDF’s current tutorial describes its AI extension as built on Microsoft Semantic Kernel and shows the core flow as: install `IronPdf.Extensions.AI`, initialize `IronDocumentAI` with a Semantic Kernel and memory, load a `PdfDocument`, and call `await pdf.Summarize()`. ([IronPDF][1])
+
+---
+
+# What this demo does not do
+
+Do **not** add:
+
+* new controller
+* new Razor view
+* new API endpoint
+* new database column
+* new `IDocumentAiSummaryService`
+* new Azure OpenAI client registration
+* new RAG pipeline
+* new vector store
+
+The existing document pipeline is enough.
+
+---
+
+# Current starting point
+
+The existing `DocumentProcessingService` already does the right sequence:
+
+1. Loads the stored PDF file.
+2. Extracts text with IronPDF.
+3. Falls back to IronOCR if embedded text is not useful.
+4. Saves raw text to `PortalDocumentContent`.
+5. Sets `document.ExtractedTextPreview = CreatePreview(rawText);`
+6. Moves the document to `TextExtracted`. 
+
+The important current line is:
+
+```csharp
+document.ExtractedTextPreview = CreatePreview(rawText);
+```
+
+That is the only Web-layer behavior we need to improve.
+
+---
+
+# Important technical note
+
+IronPDF’s tutorial currently shows this memory setup:
+
+```csharp
+var memory = new MemoryBuilder()
+    .WithMemoryStore(new VolatileMemoryStore())
+    .WithAzureOpenAITextEmbeddingGeneration(embeddingDeployment, azureEndpoint, apiKey)
+    .Build();
+```
+
+([IronPDF][1])
+
+Do **not** use that exact line in this project.
+
+You already hit the compile error because `MemoryBuilder.WithAzureOpenAITextEmbeddingGeneration(...)` is not available in your current package/API combination.
+
+Also, Microsoft’s Semantic Kernel guidance says embedding workflows are moving from older SK embedding abstractions toward `Microsoft.Extensions.AI.IEmbeddingGenerator<string, Embedding<float>>`. Your branch already uses that newer abstraction for embeddings and vector search. ([Microsoft Learn][2])
+
+So the clean project-specific solution is:
+
+> Use the existing centralized `IEmbeddingGenerator<string, Embedding<float>>`, adapt it only where IronPDF requires Semantic Kernel memory, and keep that compatibility code isolated inside `KnowledgeOps.AI`.
+
+---
+
+# Files modified
+
+```text
+Directory.Packages.props
+
+KnowledgeOps.AI/
+  KnowledgeOps.AI.csproj
+  IronPdfAiInitializer.cs
+
+KnowledgeOps.Web/
+  KnowledgeOps.Web.csproj
+  Services/IDocumentProcessingService.cs
+```
+
+---
+
+# Step 1 — Add package versions
+
+Open:
+
+```text
+Directory.Packages.props
+```
+
+Add:
+
+```xml
+<PackageVersion Include="IronPdf.Extensions.AI" Version="2026.5.2" />
+<PackageVersion Include="Microsoft.SemanticKernel.Plugins.Memory" Version="1.75.0-alpha" />
+```
+
+The memory package is needed because IronPDF AI initialization expects Semantic Kernel memory support. IronPDF’s tutorial lists `Microsoft.SemanticKernel.Plugins.Memory` as part of its AI PDF processing setup. ([IronPDF][1])
+
+Keep this lesson scoped. Do not add unrelated packages.
+
+---
+
+# Step 2 — Update `KnowledgeOps.AI.csproj`
+
+Open:
+
+```text
+KnowledgeOps.AI/KnowledgeOps.AI.csproj
+```
+
+Add:
+
+```xml
+<PackageReference Include="IronPdf.Extensions.AI" />
+<PackageReference Include="Microsoft.SemanticKernel.Plugins.Memory" />
+```
+
+Add warning suppression for the Semantic Kernel memory APIs:
+
+```xml
+<PropertyGroup>
+  <NoWarn>$(NoWarn);SKEXP0001;SKEXP0010;SKEXP0050</NoWarn>
+</PropertyGroup>
+```
+
+## Why this belongs in `.AI`
+
+`KnowledgeOps.AI` already owns Semantic Kernel and AI service composition. The IronPDF AI initializer depends on the shared kernel and embedding services, so it belongs there.
+
+---
+
+# Step 3 — Update `KnowledgeOps.Web.csproj`
+
+Open:
+
+```text
+KnowledgeOps.Web/KnowledgeOps.Web.csproj
+```
+
+Add:
+
+```xml
+<PackageReference Include="IronPdf.Extensions.AI" />
+```
+
+Why Web needs this:
+
+`DocumentProcessingService` will call the extension method:
+
+```csharp
+await pdf.Summarize();
+```
+
+That extension comes from `IronPdf.Extensions.AI`.
+
+Do not add `Microsoft.SemanticKernel.Plugins.Memory` to Web. Memory setup stays in `KnowledgeOps.AI`.
+
+---
+
+# Step 4 — Add `IronPdfAiInitializer` to `KnowledgeOps.AI`
+
+Create:
+
+```text
+KnowledgeOps.AI/IronPdfAiInitializer.cs
+```
+
+```csharp
+using IronPdf.AI;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Embeddings;
+using Microsoft.SemanticKernel.Memory;
+
+namespace KnowledgeOps.AI;
+
+public sealed class IronPdfAiInitializer(
+    Kernel kernel,
+    IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator,
+    ILogger<IronPdfAiInitializer> logger)
+{
+    private int _initialized;
+
+    public void EnsureInitialized()
+    {
+        if (Interlocked.Exchange(ref _initialized, 1) == 1)
+        {
+            return;
+        }
+
+        var embeddingService =
+            embeddingGenerator.AsTextEmbeddingGenerationService();
+
+        var memory = new SemanticTextMemory(
+            new VolatileMemoryStore(),
+            embeddingService);
+
+        IronDocumentAI.Initialize(kernel, memory);
+
+        logger.LogInformation(
+            "IronPDF AI initialized with the shared KnowledgeOps Semantic Kernel.");
+    }
+}
+```
+
+## Why this is the safe implementation
+
+This avoids the method that caused the compile error:
+
+```csharp
+WithAzureOpenAITextEmbeddingGeneration(...)
+```
+
+Instead, it reuses the already centralized `Microsoft.Extensions.AI` embedding generator.
+
+Microsoft documents `AsTextEmbeddingGenerationService(...)` as a bridge from `IEmbeddingGenerator<string, Embedding<float>>` into Semantic Kernel’s `ITextEmbeddingGenerationService`, and Microsoft’s migration guidance identifies `IEmbeddingGenerator<string, Embedding<float>>` as the newer preferred embedding abstraction. ([Microsoft Learn][2])
+
+## Instructor explanation
+
+Say:
+
+> IronPDF AI still expects Semantic Kernel memory during initialization. Rather than creating another Azure OpenAI embedding setup, we adapt the embedding generator already registered by the application. This keeps the Azure OpenAI configuration centralized and avoids duplicated setup.
+
+---
+
+# Step 5 — Register `IronPdfAiInitializer`
+
+Open:
+
+```text
+KnowledgeOps.AI/ServiceCollectionExtensions.cs
+```
+
+At the end of `AddKnowledgeOpsAI(...)`, before `return services;`, add:
+
+```csharp
+services.AddSingleton<IronPdfAiInitializer>();
+```
+
+The end of the method should now look conceptually like this:
+
+```csharp
+services.AddSingleton(sp =>
+    sp.GetRequiredService<Kernel>().GetRequiredService<IChatCompletionService>());
+
+services.AddSingleton<IKnowledgeOpsChatClient, KnowledgeOpsChatClient>();
+
+services.AddSingleton<IronPdfAiInitializer>();
+
+return services;
+```
+
+Do not create another kernel.
+Do not create another Azure OpenAI client.
+Do not register another embedding generator.
+
+The cleanup lesson already centralized those pieces.
+
+---
+
+# Step 6 — Update `DocumentProcessingService` imports
+
+Open:
+
+```text
+KnowledgeOps.Web/Services/IDocumentProcessingService.cs
+```
+
+Add:
+
+```csharp
+using IronPdf.AI;
+using KnowledgeOps.AI;
+```
+
+`IronPdf.AI` gives access to the `Summarize()` extension method.
+
+`KnowledgeOps.AI` gives access to `IronPdfAiInitializer`.
+
+---
+
+# Step 7 — Inject the initializer into `DocumentProcessingService`
+
+Current constructor:
+
+```csharp
+public class DocumentProcessingService(
+    ApplicationDbContext dbContext,
+    ILogger<DocumentProcessingService> logger) : IDocumentProcessingService
+```
+
+Update it:
+
+```csharp
+public class DocumentProcessingService(
+    ApplicationDbContext dbContext,
+    IronPdfAiInitializer ironPdfAiInitializer,
+    ILogger<DocumentProcessingService> logger) : IDocumentProcessingService
+```
+
+Do not inject:
+
+* `Kernel`
+* `AzureOpenAIOptions`
+* `AzureOpenAIClient`
+* `IEmbeddingGenerator`
+* `ISemanticTextMemory`
+
+Those details are intentionally hidden behind the initializer.
+
+---
+
+# Step 8 — Replace `CreatePreview` with `CreatePreviewAsync`
+
+Current method:
+
+```csharp
+private string? CreatePreview(string rawText)
+{
+    if (rawText.Length <= PreviewLength)
+    {
+        return rawText;
+    }
+
+    return rawText[..PreviewLength] + "...";
+}
+```
+
+Replace it with:
+
+```csharp
+private async Task<string?> CreatePreviewAsync(
+    PortalDocument document,
+    PdfDocument pdf,
+    string rawText,
+    CancellationToken cancellationToken)
+{
+    cancellationToken.ThrowIfCancellationRequested();
+
+    try
+    {
+        ironPdfAiInitializer.EnsureInitialized();
+
+        logger.LogInformation(
+            "Generating IronPDF AI summary for document {DocumentId}.",
+            document.Id);
+
+        string summary = await pdf.Summarize();
+
+        if (!string.IsNullOrWhiteSpace(summary))
+        {
+            string normalizedSummary = NormalizeExtractedText(summary);
+
+            logger.LogInformation(
+                "IronPDF AI summary generated for document {DocumentId}. Summary length: {SummaryLength}.",
+                document.Id,
+                normalizedSummary.Length);
+
+            return normalizedSummary;
+        }
+
+        logger.LogWarning(
+            "IronPDF AI summary returned empty content for document {DocumentId}. Falling back to text preview.",
+            document.Id);
+    }
+    catch (Exception exception)
+    {
+        logger.LogError(
+            exception,
+            "IronPDF AI summary failed for document {DocumentId}. Falling back to text preview.",
+            document.Id);
+    }
+
+    return CreateTextPreview(rawText);
+}
+```
+
+Now add this small private helper:
+
+```csharp
+private string? CreateTextPreview(string rawText)
+{
+    if (rawText.Length <= PreviewLength)
+    {
+        return rawText;
+    }
+
+    return rawText[..PreviewLength] + "...";
+}
+```
+
+## Why add this helper?
+
+This keeps `CreatePreviewAsync` focused:
+
+```text
+Try AI summary
+Fallback to old preview logic
+```
+
+The fallback logic remains clear and reusable.
+
+This is not unnecessary abstraction. It keeps the old preview behavior intact and makes the new async method easier to read.
+
+---
+
+# Step 9 — Update the call site
+
+Find:
+
+```csharp
+document.ExtractedTextPreview = CreatePreview(rawText);
+```
+
+Replace it with:
+
+```csharp
+document.ExtractedTextPreview = await CreatePreviewAsync(
+    document,
+    pdf,
+    rawText,
+    cancellationToken);
+```
+
+The final block should look like this:
+
+```csharp
+if (document.Content is null)
+{
+    dbContext.PortalDocumentContents.Add(new PortalDocumentContent
+    {
+        PortalDocumentId = document.Id,
+        RawText = rawText,
+        CharacterCount = rawText.Length,
+        PageCount = pageCount,
+        ExtractionEngine = processingMethod,
+        ExtractedUtc = DateTime.UtcNow
+    });
+}
+else
+{
+    document.Content.RawText = rawText;
+    document.Content.CharacterCount = rawText.Length;
+    document.Content.PageCount = pageCount;
+    document.Content.ExtractionEngine = processingMethod;
+    document.Content.ExtractedUtc = DateTime.UtcNow;
+}
+
+document.ExtractedTextPreview = await CreatePreviewAsync(
+    document,
+    pdf,
+    rawText,
+    cancellationToken);
+
+document.ProcessingStatus = DocumentProcessingStatus.TextExtracted;
+document.ProcessingError = null;
+document.ProcessedUtc = DateTime.UtcNow;
+
+await dbContext.SaveChangesAsync(cancellationToken);
+```
+
+This keeps the existing pipeline exactly where it belongs.
+
+---
+
+# Step 10 — Build
+
+Run:
+
+```bash
+dotnet clean
+dotnet restore
+dotnet build
+```
+
+## Expected result
+
+The project should build without the earlier error:
+
+```text
+MemoryBuilder does not contain a definition for WithAzureOpenAITextEmbeddingGeneration
+```
+
+because the implementation does not call that method.
+
+---
+
+# Step 11 — Test with an uploaded PDF
+
+Use one of the sample policy PDFs.
+
+Example:
+
+```text
+HR_Remote_Work_and_Flexible_Schedule_Policy.pdf
+```
+
+Expected behavior:
+
+1. Upload the document.
+2. Document processing worker claims it.
+3. IronPDF extracts text.
+4. OCR fallback still works if needed.
+5. `CreatePreviewAsync` initializes IronPDF AI if needed.
+6. `pdf.Summarize()` returns a real summary.
+7. `ExtractedTextPreview` stores the AI summary.
+8. The existing document list/details view shows the improved summary.
+
+Example summary:
+
+```text
+This policy outlines eligibility for remote work and flexible schedules, employee availability expectations, manager approval requirements, equipment responsibilities, security practices, and exceptions for temporary arrangements.
+```
+
+---
+
+# Step 12 — Test fallback behavior
+
+To verify resilience, you can temporarily make the AI call fail by using an invalid AI configuration in a local test environment.
+
+Expected result:
+
+* processing does not fail,
+* the error is logged,
+* `ExtractedTextPreview` falls back to the raw text preview,
+* the document still moves to `TextExtracted`.
+
+This matters because AI summarization is an enhancement, not a hard dependency for extraction.
+
+---
+
+# Code recap
+
+## `KnowledgeOps.AI/IronPdfAiInitializer.cs`
+
+```csharp
+using IronPdf.AI;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
+using Microsoft.SemanticKernel.Embeddings;
+using Microsoft.SemanticKernel.Memory;
+
+namespace KnowledgeOps.AI;
+
+public sealed class IronPdfAiInitializer(
+    Kernel kernel,
+    IEmbeddingGenerator<string, Embedding<float>> embeddingGenerator,
+    ILogger<IronPdfAiInitializer> logger)
+{
+    private int _initialized;
+
+    public void EnsureInitialized()
+    {
+        if (Interlocked.Exchange(ref _initialized, 1) == 1)
+        {
+            return;
+        }
+
+        var embeddingService =
+            embeddingGenerator.AsTextEmbeddingGenerationService();
+
+        var memory = new SemanticTextMemory(
+            new VolatileMemoryStore(),
+            embeddingService);
+
+        IronDocumentAI.Initialize(kernel, memory);
+
+        logger.LogInformation(
+            "IronPDF AI initialized with the shared KnowledgeOps Semantic Kernel.");
+    }
+}
+```
+
+---
+
+## `ServiceCollectionExtensions.cs`
+
+Add:
+
+```csharp
+services.AddSingleton<IronPdfAiInitializer>();
+```
+
+---
+
+## `DocumentProcessingService`
+
+Constructor:
+
+```csharp
+public class DocumentProcessingService(
+    ApplicationDbContext dbContext,
+    IronPdfAiInitializer ironPdfAiInitializer,
+    ILogger<DocumentProcessingService> logger) : IDocumentProcessingService
+```
+
+Preview call:
+
+```csharp
+document.ExtractedTextPreview = await CreatePreviewAsync(
+    document,
+    pdf,
+    rawText,
+    cancellationToken);
+```
+
+Preview methods:
+
+```csharp
+private async Task<string?> CreatePreviewAsync(
+    PortalDocument document,
+    PdfDocument pdf,
+    string rawText,
+    CancellationToken cancellationToken)
+{
+    cancellationToken.ThrowIfCancellationRequested();
+
+    try
+    {
+        ironPdfAiInitializer.EnsureInitialized();
+
+        logger.LogInformation(
+            "Generating IronPDF AI summary for document {DocumentId}.",
+            document.Id);
+
+        string summary = await pdf.Summarize();
+
+        if (!string.IsNullOrWhiteSpace(summary))
+        {
+            string normalizedSummary = NormalizeExtractedText(summary);
+
+            logger.LogInformation(
+                "IronPDF AI summary generated for document {DocumentId}. Summary length: {SummaryLength}.",
+                document.Id,
+                normalizedSummary.Length);
+
+            return normalizedSummary;
+        }
+
+        logger.LogWarning(
+            "IronPDF AI summary returned empty content for document {DocumentId}. Falling back to text preview.",
+            document.Id);
+    }
+    catch (Exception exception)
+    {
+        logger.LogError(
+            exception,
+            "IronPDF AI summary failed for document {DocumentId}. Falling back to text preview.",
+            document.Id);
+    }
+
+    return CreateTextPreview(rawText);
+}
+
+private string? CreateTextPreview(string rawText)
+{
+    if (rawText.Length <= PreviewLength)
+    {
+        return rawText;
+    }
+
+    return rawText[..PreviewLength] + "...";
+}
+```
+
+---
+
+# Instructor narration script
+
+## Opening
+
+> In the previous cleanup, we centralized AI service registration so the Web project no longer creates Azure OpenAI clients directly. Now we can use that cleaner foundation to add IronPDF AI summarization to the existing document-processing pipeline.
+
+## Explain the problem
+
+> Right now, the document preview is just the first part of the extracted text. That is useful, but it is not a true summary. A summary should tell the user what the document is about.
+
+## Explain the design
+
+> We will keep the processing flow where it is. The only behavior change is inside the preview creation step. We will try to summarize the PDF using IronPDF AI. If that fails, we fall back to the original text preview.
+
+## Explain the initializer
+
+> IronPDF AI needs Semantic Kernel and memory to be initialized. We keep that setup inside `KnowledgeOps.AI`, because that project already owns our AI configuration. The Web project only asks the initializer to make sure IronPDF AI is ready.
+
+## Explain the summarization call
+
+> Once IronPDF AI is initialized, the actual summary call is simple: `await pdf.Summarize()`. IronPDF handles the PDF-to-AI preparation internally.
+
+## Closing
+
+> This gives users a more useful document preview without changing the UI, database, or workflow. The system still extracts and stores raw text for RAG, but the preview now becomes a proper AI-generated summary.
+
+---
+
+# Final checklist
+
+At the end of this demo:
+
+* `IronPdf.Extensions.AI` is installed.
+* `Microsoft.SemanticKernel.Plugins.Memory` is installed in `.AI`.
+* `IronPdfAiInitializer` exists in `KnowledgeOps.AI`.
+* The initializer reuses the centralized `Kernel`.
+* The initializer reuses the centralized `IEmbeddingGenerator<string, Embedding<float>>`.
+* No new Azure OpenAI client is created.
+* `DocumentProcessingService` calls `pdf.Summarize()`.
+* `CreatePreview` is replaced with `CreatePreviewAsync`.
+* Old text-preview behavior remains as fallback.
+* No new controller is added.
+* No new view is added.
+* No new database field is added.
+* Uploaded PDFs now show a proper AI-generated summary where the old text snippet used to appear.
+
+[1]: https://ironpdf.com/tutorials/ai-powered-pdf-processing-csharp/?utm_source=chatgpt.com "AI-Powered PDF Processing in C#: Summarize, Extract, and Analyze Documents"
+[2]: https://learn.microsoft.com/en-us/semantic-kernel/support/migration/text-embedding-obsolete-migration-guide?utm_source=chatgpt.com "Migrating from ITextEmbeddingGenerationService to IEmbeddingGenerator | Microsoft Learn"
